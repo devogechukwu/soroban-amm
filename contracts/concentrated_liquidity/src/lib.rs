@@ -5,6 +5,9 @@
 pub mod math;
 pub mod tick_bitmap;
 
+#[cfg(test)]
+mod tests_quote_parity;
+
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
@@ -1226,91 +1229,13 @@ impl ConcentratedLiquidity {
         //    Dust = amount_in - amount_used (never transferred; stays with provider).
         //
 
-        let (amount_a, amount_b, liquidity, amount_used) = if current_tick < lower_tick {
-            // Case 1: price below range — only token A
-            if !is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            // Use proper sqrtPriceX96 formulas for accurate calculation
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (amount_in, 0_i128, liq.max(1), amount_in)
-        } else if current_tick >= upper_tick {
-            // Case 2: price above range — only token B
-            if is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            // Use proper sqrtPriceX96 formulas for accurate calculation
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (0_i128, amount_in, liq.max(1), amount_in)
-        } else {
-            // Case 3: price in range — compute liquidity from the single token's half
-            // Using proper Uniswap V3 formulas with sqrtPriceX96
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
-
-            if sqrt_current >= sqrt_upper {
-                // Degenerate: current at or above upper tick
-                if is_token_a {
-                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (used, 0_i128, liq, used)
-                } else {
-                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (0_i128, used, liq, used)
-                }
-            } else if sqrt_current <= sqrt_lower {
-                // Degenerate: current at or below lower tick
-                if is_token_a {
-                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (used, 0_i128, liq, used)
-                } else {
-                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (0_i128, used, liq, used)
-                }
-            } else if is_token_a {
-                // Token A covers [current_price, upper_price].
-                // Liquidity is computed from the amount, then we back-compute actual token amount.
-                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (used, 0_i128, liq, used)
-            } else {
-                // Token B covers [lower_price, current_price].
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (0_i128, used, liq, used)
-            }
-        };
-        if liquidity <= 0 {
-            return Err(ClError::ZeroLiquidity);
-        }
+        let (amount_a, amount_b, liquidity, amount_used) = Self::compute_single_token_deposit(
+            current_tick,
+            lower_tick,
+            upper_tick,
+            is_token_a,
+            amount_in,
+        )?;
         if liquidity < min_liquidity {
             return Err(ClError::SlippageExceeded);
         }
@@ -1417,6 +1342,67 @@ impl ConcentratedLiquidity {
         })
     }
 
+    /// Shared amount/liquidity calculation for `mint_position_single_token` and
+    /// `quote_single_token_deposit`.
+    ///
+    /// Returns `(amount_a, amount_b, liquidity, amount_used)`.
+    fn compute_single_token_deposit(
+        current_tick: i32,
+        lower_tick: i32,
+        upper_tick: i32,
+        is_token_a: bool,
+        amount_in: i128,
+    ) -> Result<(i128, i128, i128, i128), ClError> {
+        let (amount_a, amount_b, liquidity, amount_used) = if current_tick < lower_tick {
+            // Case 1: price below range — only token A
+            if !is_token_a {
+                return Err(ClError::SlippageExceeded);
+            }
+            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
+            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
+            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
+                .ok_or(ClError::MathOverflow)?;
+            (amount_in, 0_i128, liq.max(1), amount_in)
+        } else if current_tick >= upper_tick {
+            // Case 2: price above range — only token B
+            if is_token_a {
+                return Err(ClError::SlippageExceeded);
+            }
+            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
+            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
+            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
+                .ok_or(ClError::MathOverflow)?;
+            (0_i128, amount_in, liq.max(1), amount_in)
+        } else {
+            // Case 3: price in range — compute liquidity from the single token's half
+            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
+            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
+            let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
+
+            if is_token_a {
+                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
+                let liq = liq.max(1);
+                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
+                    .ok_or(ClError::MathOverflow)?;
+                (used, 0_i128, liq, used)
+            } else {
+                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
+                let liq = liq.max(1);
+                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
+                    .ok_or(ClError::MathOverflow)?;
+                (0_i128, used, liq, used)
+            }
+        };
+
+        if liquidity <= 0 || (amount_a <= 0 && amount_b <= 0) {
+            return Err(ClError::ZeroLiquidity);
+        }
+
+        Ok((amount_a, amount_b, liquidity, amount_used))
+    }
+
     /// Quote the expected result of a single-token deposit without executing it.
     ///
     /// Pure read — does not transfer tokens or modify state.
@@ -1436,6 +1422,14 @@ impl ConcentratedLiquidity {
         if lower_tick < MIN_TICK || upper_tick > MAX_TICK {
             return Err(ClError::TickOutOfRange);
         }
+        let tick_spacing: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TickSpacing)
+            .unwrap_or(1);
+        if lower_tick % tick_spacing != 0 || upper_tick % tick_spacing != 0 {
+            return Err(ClError::TickNotAligned);
+        }
         if amount_in <= 0 {
             return Err(ClError::ZeroAmounts);
         }
@@ -1447,55 +1441,13 @@ impl ConcentratedLiquidity {
         }
 
         let current_tick = Self::read_current_tick(&env)?;
-
-        // Mirror the exact same logic as mint_position_single_token.
-        let (liquidity, amount_used) = if current_tick < lower_tick {
-            if !is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (liq.max(1), amount_in)
-        } else if current_tick >= upper_tick {
-            if is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (liq.max(1), amount_in)
-        } else {
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
-
-            if sqrt_current >= sqrt_upper {
-                let liq = math::get_liquidity_for_amount0(sqrt_upper, sqrt_upper, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq.max(1), amount_in)
-            } else if sqrt_current <= sqrt_lower {
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_lower, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq.max(1), amount_in)
-            } else if is_token_a {
-                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq, used)
-            } else {
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq, used)
-            }
-        };
+        let (_amount_a, _amount_b, liquidity, amount_used) = Self::compute_single_token_deposit(
+            current_tick,
+            lower_tick,
+            upper_tick,
+            is_token_a,
+            amount_in,
+        )?;
 
         Ok(SingleTokenDepositResult {
             amount_used,
