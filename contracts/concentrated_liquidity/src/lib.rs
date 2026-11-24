@@ -105,6 +105,9 @@ pub enum ClError {
     /// `set_oracle_cardinality` was called with zero, a value smaller than the
     /// current cardinality, or a value above `MAX_ORACLE_CARDINALITY` (#1101).
     InvalidOracleCardinality = 27,
+    /// `set_position_nft` was given an address that is not a `cl_position_nft`
+    /// contract initialized with this pool's address as its `cl_pool`.
+    NftNotWiredToPool = 28,
 }
 
 /// Status of a range order (issue #295).
@@ -219,6 +222,7 @@ pub trait PositionNftInterface {
     fn mint(env: Env, to: Address, pool: Address, lower_tick: i32, upper_tick: i32) -> u64;
     fn burn(env: Env, token_id: u64);
     fn owner_of(env: Env, token_id: u64) -> Address;
+    fn cl_pool(env: Env) -> Address;
 }
 
 #[contracttype]
@@ -460,6 +464,17 @@ impl ConcentratedLiquidity {
         // Changing from Some(A) → Some(B) is forbidden.
         if existing_nft.is_some() && nft.is_some() && existing_nft != nft {
             return Err(ClError::NftContractChangeBlocked);
+        }
+
+        // Verify the candidate NFT contract is initialized and wired to this pool.
+        if let Some(ref nft_addr) = nft {
+            let wired_pool = match PositionNftClient::new(&env, nft_addr).try_cl_pool() {
+                Ok(Ok(pool)) => pool,
+                _ => return Err(ClError::NftNotWiredToPool),
+            };
+            if wired_pool != env.current_contract_address() {
+                return Err(ClError::NftNotWiredToPool);
+            }
         }
 
         env.storage().instance().set(&DataKey::PositionNft, &nft);
@@ -8416,6 +8431,131 @@ mod test_single_token_deposit {
             f.client.position_of_token(&0_u64),
             Some((f.alice.clone(), f.lower, f.upper))
         );
+    }
+
+    #[test]
+    fn set_position_nft_rejects_uninitialized_nft() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let uninit_nft = env.register_contract(None, ClPositionNft);
+        assert_eq!(
+            client.try_set_position_nft(&admin, &Some(uninit_nft)),
+            Err(Ok(ClError::NftNotWiredToPool))
+        );
+        assert_eq!(client.position_nft(), None);
+    }
+
+    #[test]
+    fn set_position_nft_rejects_nft_wired_to_other_pool() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let other_pool = Address::generate(&env);
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &other_pool);
+
+        assert_eq!(
+            client.try_set_position_nft(&admin, &Some(nft_addr)),
+            Err(Ok(ClError::NftNotWiredToPool))
+        );
+        assert_eq!(client.position_nft(), None);
+    }
+
+    #[test]
+    fn set_position_nft_rejects_non_contract_address() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let non_contract = Address::generate(&env);
+        assert_eq!(
+            client.try_set_position_nft(&admin, &Some(non_contract)),
+            Err(Ok(ClError::NftNotWiredToPool))
+        );
+        assert_eq!(client.position_nft(), None);
+    }
+
+    #[test]
+    fn set_position_nft_accepts_wired_nft_and_mints_token() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+
+        client.set_position_nft(&admin, &Some(nft_addr.clone()));
+        assert_eq!(client.position_nft(), Some(nft_addr));
+
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+        client.mint_position(
+            &alice,
+            &-100_i32,
+            &100_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        assert_eq!(nft.owner_of(&0_u64), alice);
+        assert_eq!(client.position_token_id(&alice, &-100_i32, &100_i32), Some(0_u64));
     }
 
     #[test]

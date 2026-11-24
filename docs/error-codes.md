@@ -220,6 +220,7 @@ Defined in [contracts/concentrated_liquidity/src/lib.rs](../contracts/concentrat
 | 25 | `MathOverflow` | A position amount or liquidity figure computed by `mint_position`, `mint_position_single_token`, `quote_single_token_deposit`, `modify_position`, `burn_position` or `quote_position` does not fit in an `i128`, or an intermediate of its 256-bit evaluation does not fit in a `u128`. Reported instead of a truncated value (#963). | Use a smaller amount or liquidity, or a wider tick range. |
 | 26 | `ObservationTooOld` | `observe(seconds_ago)` requested a timestamp earlier than the oldest observation retained in the persistent oracle ring buffer (or `seconds_ago > now`) (#1101). | Query a smaller `seconds_ago` within the retained ring-buffer window, or have the admin grow the ring capacity via `set_oracle_cardinality`. |
 | 27 | `InvalidOracleCardinality` | `set_oracle_cardinality` was called with `0`, a value smaller than the current `cardinality`, or a value exceeding `MAX_ORACLE_CARDINALITY` (`2048`) (#1101). | Pass a cardinality in `[current_cardinality, 2048]`. |
+| 28 | `NftNotWiredToPool` | `set_position_nft` was called with an address that is not a `cl_position_nft` contract initialized with this pool's address as its `cl_pool`. | Initialize the `cl_position_nft` contract with this pool's address as `cl_pool` before calling `set_position_nft`. |
 
 `swap_exact_out(env, sender, zero_for_one, amount_out, sqrt_price_limit_x96,
 max_amount_in, deadline)` (#696) is the mirror of `swap`: it fixes the
