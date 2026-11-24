@@ -1411,4 +1411,208 @@ mod tests {
     fn test_ttl_bump_is_paused() {
         assert_view_ttl_bump(6);
     }
+
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::test_runner::RngSeed;
+
+        #[derive(Debug, Clone)]
+        struct RandomRouteCase {
+            num_pools: usize,
+            fee_tiers: [i128; 4],
+            deposits_a: [i128; 4],
+            deposits_b: [i128; 4],
+            start_idx: usize,
+            path_len: usize,
+            reverse: bool,
+            amount_in: i128,
+        }
+
+        fn route_case_strategy() -> impl Strategy<Value = RandomRouteCase> {
+            (
+                2usize..=4,
+                prop::array::uniform4(0i128..=3),
+                prop::array::uniform4(200_000i128..=5_000_000),
+                prop::array::uniform4(200_000i128..=5_000_000),
+                2usize..=4,
+                0usize..=4,
+                any::<bool>(),
+                1_000i128..=20_000,
+            )
+                .prop_map(
+                    |(
+                        num_pools,
+                        fee_tiers,
+                        deposits_a,
+                        deposits_b,
+                        raw_path_len,
+                        raw_start,
+                        reverse,
+                        amount_in,
+                    )| {
+                        let num_tokens = num_pools + 1;
+                        let path_len = raw_path_len.min(num_tokens);
+                        let max_start = num_tokens - path_len;
+                        let start_idx = if max_start == 0 {
+                            0
+                        } else {
+                            raw_start % (max_start + 1)
+                        };
+                        RandomRouteCase {
+                            num_pools,
+                            fee_tiers,
+                            deposits_a,
+                            deposits_b,
+                            start_idx,
+                            path_len,
+                            reverse,
+                            amount_in,
+                        }
+                    },
+                )
+        }
+
+        struct RandomRouteFixture {
+            env: Env,
+            router: Address,
+            trader: Address,
+            path: soroban_sdk::Vec<Address>,
+        }
+
+        fn setup_random_route(case: &RandomRouteCase) -> RandomRouteFixture {
+            let env = Env::default();
+            env.mock_all_auths();
+            env.budget().reset_unlimited();
+
+            let admin = Address::generate(&env);
+            let amm_wasm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+            let lp_wasm_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+            let factory_addr = env.register_contract(None, Factory);
+            let factory = FactoryClient::new(&env, &factory_addr);
+            factory.initialize(&admin, &amm_wasm_hash, &lp_wasm_hash);
+
+            let router_addr = env.register_contract(None, Router);
+            RouterClient::new(&env, &router_addr).initialize(&admin, &factory_addr);
+
+            let num_tokens = case.num_pools + 1;
+            let mut tokens: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+            for _ in 0..num_tokens {
+                tokens.push_back(
+                    env.register_stellar_asset_contract_v2(admin.clone())
+                        .address(),
+                );
+            }
+
+            let lp = Address::generate(&env);
+            let trader = Address::generate(&env);
+            for i in 0..tokens.len() {
+                let t = tokens.get(i).unwrap();
+                StellarAssetClient::new(&env, &t).mint(&lp, &100_000_000_i128);
+                StellarAssetClient::new(&env, &t).mint(&trader, &10_000_000_i128);
+            }
+
+            for i in 0..case.num_pools {
+                let a = tokens.get(i as u32).unwrap();
+                let b = tokens.get((i + 1) as u32).unwrap();
+                factory.create_pool(&admin, &a, &b, &case.fee_tiers[i], &None);
+                let pool = factory.get_pool(&a, &b).unwrap();
+                amm::AmmPoolClient::new(&env, &pool).add_liquidity(
+                    &lp,
+                    &case.deposits_a[i],
+                    &case.deposits_b[i],
+                    &0,
+                    &u64::MAX,
+                );
+            }
+
+            let mut path: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+            if case.reverse {
+                for offset in (0..case.path_len).rev() {
+                    path.push_back(tokens.get((case.start_idx + offset) as u32).unwrap());
+                }
+            } else {
+                for offset in 0..case.path_len {
+                    path.push_back(tokens.get((case.start_idx + offset) as u32).unwrap());
+                }
+            }
+
+            RandomRouteFixture {
+                env,
+                router: router_addr,
+                trader,
+                path,
+            }
+        }
+
+        fn deterministic_config(seed: u64) -> ProptestConfig {
+            ProptestConfig {
+                cases: 256,
+                failure_persistence: None,
+                rng_seed: RngSeed::Fixed(seed),
+                ..ProptestConfig::default()
+            }
+        }
+
+        proptest! {
+            #![proptest_config(deterministic_config(0x524f_5554_4552_0001))]
+            #[test]
+            fn prop_amounts_out_path_last_matches_scalar_quote(case in route_case_strategy()) {
+                let f = setup_random_route(&case);
+                let router = RouterClient::new(&f.env, &f.router);
+
+                let breakdown = router.get_amounts_out_path(&f.path, &case.amount_in);
+                let scalar = router.get_amount_out_path(&f.path, &case.amount_in);
+
+                prop_assert_eq!(breakdown.len(), f.path.len());
+                prop_assert_eq!(breakdown.get(0).unwrap(), case.amount_in);
+                prop_assert_eq!(breakdown.last().unwrap(), scalar);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(deterministic_config(0x524f_5554_4554_0002))]
+            #[test]
+            fn prop_swap_exact_out_matches_quote(case in route_case_strategy()) {
+                let f = setup_random_route(&case);
+                let router = RouterClient::new(&f.env, &f.router);
+
+                let out = router.get_amount_out_path(&f.path, &case.amount_in);
+                prop_assume!(out > 0);
+
+                let quoted_in = router.get_amount_in_path(&f.path, &out);
+                let spent = router.swap_exact_out(
+                    &f.trader,
+                    &f.path,
+                    &out,
+                    &quoted_in,
+                    &u64::MAX,
+                );
+                prop_assert_eq!(spent, quoted_in);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(deterministic_config(0x524f_5554_4552_0003))]
+            #[test]
+            fn prop_round_trip_in_out_bounded_by_hops(case in route_case_strategy()) {
+                let f = setup_random_route(&case);
+                let router = RouterClient::new(&f.env, &f.router);
+
+                let out = router.get_amount_out_path(&f.path, &case.amount_in);
+                prop_assume!(out > 0);
+
+                let round_trip = router.get_amount_in_path(&f.path, &out);
+                let hops = (f.path.len() - 1) as i128;
+                prop_assert!(
+                    round_trip <= case.amount_in + hops,
+                    "round_trip ({}) exceeded amount_in ({}) + hops ({})",
+                    round_trip,
+                    case.amount_in,
+                    hops
+                );
+            }
+        }
+    }
 }
