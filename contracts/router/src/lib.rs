@@ -1412,50 +1412,75 @@ mod tests {
         assert_view_ttl_bump(6);
     }
 
-    mod proptests {
+    mod prop_tests {
         use super::*;
         use proptest::prelude::*;
         use proptest::test_runner::RngSeed;
 
-        const PROPTEST_SEED: u64 = 0x524f_5554_4552_5054;
-
-        #[derive(Clone, Debug)]
-        struct RandomRouteScenario {
-            pool_specs: std::vec::Vec<(i128, i128, i128)>,
-            path_indices: std::vec::Vec<usize>,
+        #[derive(Debug, Clone)]
+        struct RandomRouteCase {
+            num_pools: usize,
+            fee_tiers: [i128; 4],
+            deposits_a: [i128; 4],
+            deposits_b: [i128; 4],
+            start_idx: usize,
+            path_len: usize,
+            reverse: bool,
             amount_in: i128,
         }
 
-        fn route_scenario_strategy() -> impl Strategy<Value = RandomRouteScenario> {
-            (2usize..=4).prop_flat_map(|num_pools| {
-                let num_tokens = num_pools + 1;
-                let max_path_len = num_tokens.min(4);
-                let pool_spec = (0i128..=3, 100_000i128..=10_000_000, 100_000i128..=10_000_000);
-                let pools_strat = prop::collection::vec(pool_spec, num_pools);
-                let path_strat = (2usize..=max_path_len).prop_flat_map(move |path_len| {
-                    let max_start = num_tokens - path_len;
-                    (0usize..=max_start, any::<bool>()).prop_map(move |(start, reverse)| {
-                        let mut indices: std::vec::Vec<usize> =
-                            (start..start + path_len).collect();
-                        if reverse {
-                            indices.reverse();
-                        }
-                        indices
-                    })
-                });
-                (pools_strat, path_strat, 1_000i128..=50_000).prop_map(
-                    |(pool_specs, path_indices, amount_in)| RandomRouteScenario {
-                        pool_specs,
-                        path_indices,
+        fn route_case_strategy() -> impl Strategy<Value = RandomRouteCase> {
+            (
+                2usize..=4,
+                prop::array::uniform4(0i128..=3),
+                prop::array::uniform4(200_000i128..=5_000_000),
+                prop::array::uniform4(200_000i128..=5_000_000),
+                2usize..=4,
+                0usize..=4,
+                any::<bool>(),
+                1_000i128..=20_000,
+            )
+                .prop_map(
+                    |(
+                        num_pools,
+                        fee_tiers,
+                        deposits_a,
+                        deposits_b,
+                        raw_path_len,
+                        raw_start,
+                        reverse,
                         amount_in,
+                    )| {
+                        let num_tokens = num_pools + 1;
+                        let path_len = raw_path_len.min(num_tokens);
+                        let max_start = num_tokens - path_len;
+                        let start_idx = if max_start == 0 {
+                            0
+                        } else {
+                            raw_start % (max_start + 1)
+                        };
+                        RandomRouteCase {
+                            num_pools,
+                            fee_tiers,
+                            deposits_a,
+                            deposits_b,
+                            start_idx,
+                            path_len,
+                            reverse,
+                            amount_in,
+                        }
                     },
                 )
-            })
         }
 
-        fn setup_random_route(
-            scenario: &RandomRouteScenario,
-        ) -> (Env, Address, Address, soroban_sdk::Vec<Address>) {
+        struct RandomRouteFixture {
+            env: Env,
+            router: Address,
+            trader: Address,
+            path: soroban_sdk::Vec<Address>,
+        }
+
+        fn setup_random_route(case: &RandomRouteCase) -> RandomRouteFixture {
             let env = Env::default();
             env.mock_all_auths();
             env.budget().reset_unlimited();
@@ -1471,94 +1496,120 @@ mod tests {
             let router_addr = env.register_contract(None, Router);
             RouterClient::new(&env, &router_addr).initialize(&admin, &factory_addr);
 
-            let num_tokens = scenario.pool_specs.len() + 1;
-            let mut tokens: std::vec::Vec<Address> = std::vec::Vec::with_capacity(num_tokens);
-            let lp = Address::generate(&env);
-            let trader = Address::generate(&env);
-
+            let num_tokens = case.num_pools + 1;
+            let mut tokens: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
             for _ in 0..num_tokens {
-                let t = env
-                    .register_stellar_asset_contract_v2(admin.clone())
-                    .address();
-                StellarAssetClient::new(&env, &t).mint(&lp, &1_000_000_000_i128);
-                StellarAssetClient::new(&env, &t).mint(&trader, &1_000_000_000_i128);
-                tokens.push(t);
+                tokens.push_back(
+                    env.register_stellar_asset_contract_v2(admin.clone())
+                        .address(),
+                );
             }
 
-            for (i, &(fee_tier, reserve_a, reserve_b)) in scenario.pool_specs.iter().enumerate() {
-                let a = &tokens[i];
-                let b = &tokens[i + 1];
-                factory.create_pool(&admin, a, b, &fee_tier, &None);
-                let pool = factory.get_pool(a, b).unwrap();
+            let lp = Address::generate(&env);
+            let trader = Address::generate(&env);
+            for i in 0..tokens.len() {
+                let t = tokens.get(i).unwrap();
+                StellarAssetClient::new(&env, &t).mint(&lp, &100_000_000_i128);
+                StellarAssetClient::new(&env, &t).mint(&trader, &10_000_000_i128);
+            }
+
+            for i in 0..case.num_pools {
+                let a = tokens.get(i as u32).unwrap();
+                let b = tokens.get((i + 1) as u32).unwrap();
+                factory.create_pool(&admin, &a, &b, &case.fee_tiers[i], &None);
+                let pool = factory.get_pool(&a, &b).unwrap();
                 amm::AmmPoolClient::new(&env, &pool).add_liquidity(
                     &lp,
-                    &reserve_a,
-                    &reserve_b,
+                    &case.deposits_a[i],
+                    &case.deposits_b[i],
                     &0,
                     &u64::MAX,
                 );
             }
 
-            let mut path = soroban_sdk::Vec::new(&env);
-            for &idx in &scenario.path_indices {
-                path.push_back(tokens[idx].clone());
+            let mut path: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+            if case.reverse {
+                for offset in (0..case.path_len).rev() {
+                    path.push_back(tokens.get((case.start_idx + offset) as u32).unwrap());
+                }
+            } else {
+                for offset in 0..case.path_len {
+                    path.push_back(tokens.get((case.start_idx + offset) as u32).unwrap());
+                }
             }
 
-            (env, router_addr, trader, path)
+            RandomRouteFixture {
+                env,
+                router: router_addr,
+                trader,
+                path,
+            }
+        }
+
+        fn deterministic_config(seed: u64) -> ProptestConfig {
+            ProptestConfig {
+                cases: 256,
+                failure_persistence: None,
+                rng_seed: RngSeed::Fixed(seed),
+                ..ProptestConfig::default()
+            }
         }
 
         proptest! {
-            #![proptest_config(ProptestConfig {
-                cases: 256,
-                rng_seed: RngSeed::Fixed(PROPTEST_SEED),
-                failure_persistence: None,
-                .. ProptestConfig::default()
-            })]
-
+            #![proptest_config(deterministic_config(0x524f_5554_4552_0001))]
             #[test]
-            fn prop_amounts_out_path_last_matches_scalar_quote(
-                scenario in route_scenario_strategy()
-            ) {
-                let (env, router_addr, _trader, path) = setup_random_route(&scenario);
-                let router = RouterClient::new(&env, &router_addr);
+            fn prop_amounts_out_path_last_matches_scalar_quote(case in route_case_strategy()) {
+                let f = setup_random_route(&case);
+                let router = RouterClient::new(&f.env, &f.router);
 
-                let amounts = router.get_amounts_out_path(&path, &scenario.amount_in);
-                let scalar = router.get_amount_out_path(&path, &scenario.amount_in);
-                prop_assert_eq!(amounts.last().unwrap(), scalar);
+                let breakdown = router.get_amounts_out_path(&f.path, &case.amount_in);
+                let scalar = router.get_amount_out_path(&f.path, &case.amount_in);
+
+                prop_assert_eq!(breakdown.len(), f.path.len());
+                prop_assert_eq!(breakdown.get(0).unwrap(), case.amount_in);
+                prop_assert_eq!(breakdown.last().unwrap(), scalar);
             }
+        }
 
+        proptest! {
+            #![proptest_config(deterministic_config(0x524f_5554_4554_0002))]
             #[test]
-            fn prop_swap_exact_out_matches_quoted_amount_in(
-                scenario in route_scenario_strategy()
-            ) {
-                let (env, router_addr, trader, path) = setup_random_route(&scenario);
-                let router = RouterClient::new(&env, &router_addr);
+            fn prop_swap_exact_out_matches_quote(case in route_case_strategy()) {
+                let f = setup_random_route(&case);
+                let router = RouterClient::new(&f.env, &f.router);
 
-                let out = router.get_amount_out_path(&path, &scenario.amount_in);
+                let out = router.get_amount_out_path(&f.path, &case.amount_in);
                 prop_assume!(out > 0);
 
-                let quoted_in = router.get_amount_in_path(&path, &out);
-                let spent = router.swap_exact_out(&trader, &path, &out, &quoted_in, &u64::MAX);
+                let quoted_in = router.get_amount_in_path(&f.path, &out);
+                let spent = router.swap_exact_out(
+                    &f.trader,
+                    &f.path,
+                    &out,
+                    &quoted_in,
+                    &u64::MAX,
+                );
                 prop_assert_eq!(spent, quoted_in);
             }
+        }
 
+        proptest! {
+            #![proptest_config(deterministic_config(0x524f_5554_4552_0003))]
             #[test]
-            fn prop_in_out_round_trip_within_hop_rounding(
-                scenario in route_scenario_strategy()
-            ) {
-                let (env, router_addr, _trader, path) = setup_random_route(&scenario);
-                let router = RouterClient::new(&env, &router_addr);
+            fn prop_round_trip_in_out_bounded_by_hops(case in route_case_strategy()) {
+                let f = setup_random_route(&case);
+                let router = RouterClient::new(&f.env, &f.router);
 
-                let out = router.get_amount_out_path(&path, &scenario.amount_in);
+                let out = router.get_amount_out_path(&f.path, &case.amount_in);
                 prop_assume!(out > 0);
 
-                let round_trip = router.get_amount_in_path(&path, &out);
-                let hops = (path.len() - 1) as i128;
+                let round_trip = router.get_amount_in_path(&f.path, &out);
+                let hops = (f.path.len() - 1) as i128;
                 prop_assert!(
-                    round_trip <= scenario.amount_in + hops,
+                    round_trip <= case.amount_in + hops,
                     "round_trip ({}) exceeded amount_in ({}) + hops ({})",
                     round_trip,
-                    scenario.amount_in,
+                    case.amount_in,
                     hops
                 );
             }

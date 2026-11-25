@@ -10249,6 +10249,11 @@
               "doc": "`set_oracle_cardinality` was called with zero, a value smaller than the\\ncurrent cardinality, or a value above `MAX_ORACLE_CARDINALITY` (#1101).",
               "name": "InvalidOracleCardinality",
               "value": 27
+            },
+            {
+              "doc": "`set_position_nft` was given an address that is not a `cl_position_nft`\\ncontract initialized with this pool's address as its `cl_pool`.",
+              "name": "NftNotWiredToPool",
+              "value": 28
             }
           ],
           "doc": "",
@@ -19760,7 +19765,7 @@
               "value": 29
             },
             {
-              "doc": "",
+              "doc": "Reserved: never returned. `veto` takes no caller argument; it reads the\\nstored veto multisig and requires that address's authorization, so a\\nnon-multisig caller fails the host auth check before any typed error is\\nproduced.",
               "name": "NotVetoMultisig",
               "value": 30
             },

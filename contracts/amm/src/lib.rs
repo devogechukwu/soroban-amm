@@ -674,6 +674,7 @@ impl AmmPool {
     }
 
     pub fn is_paused(env: Env) -> bool {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -682,6 +683,7 @@ impl AmmPool {
 
     /// Return `true` if the pool has undergone an emergency withdrawal.
     pub fn is_drained(env: Env) -> bool {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Drained)
@@ -744,6 +746,7 @@ impl AmmPool {
 
     /// Return the pending single-admin emergency announcement, if any.
     pub fn get_emergency_announcement(env: Env) -> Option<EmergencyAnnouncement> {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::EmergencyAnnouncement)
@@ -751,6 +754,7 @@ impl AmmPool {
 
     /// Return the configured emergency delay in seconds.
     pub fn get_emergency_delay(env: Env) -> u64 {
+        Self::extend_ttl(&env);
         Self::emergency_delay(&env)
     }
 
@@ -824,6 +828,7 @@ impl AmmPool {
     /// diagnostic; the guard itself is enforced internally by
     /// `ReentrancyGuard::acquire`.
     pub fn is_locked(env: Env) -> bool {
+        Self::extend_ttl(&env);
         Self::lock_held(&env)
     }
 
@@ -831,7 +836,8 @@ impl AmmPool {
     /// The name described only the flash-loan holder of the lock; every
     /// fund-moving entry point now holds it while executing.
     pub fn flash_loan_locked(env: Env) -> bool {
-        Self::is_locked(env)
+        Self::extend_ttl(&env);
+        Self::lock_held(&env)
     }
 
     /// Admin-only, multisig-gated last resort to clear a stranded lock.
@@ -923,6 +929,7 @@ impl AmmPool {
 
     /// Return the current circuit breaker configuration and state.
     pub fn get_circuit_breaker_config(env: Env) -> CircuitBreakerConfig {
+        Self::extend_ttl(&env);
         let threshold_bps: i128 = env
             .storage()
             .instance()
@@ -1148,6 +1155,7 @@ impl AmmPool {
     ///
     /// Returns `(None, 0)` when protocol fees are disabled.
     pub fn get_protocol_fee(env: Env) -> (Option<Address>, i128) {
+        Self::extend_ttl(&env);
         let recipient: Option<Address> = env.storage().instance().get(&DataKey::FeeRecipient);
         let bps: i128 = env
             .storage()
@@ -1187,6 +1195,7 @@ impl AmmPool {
 
     /// Return the current LP rebate rate in basis points.
     pub fn get_lp_rebate(env: Env) -> i128 {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::LpRebateBps)
@@ -1225,6 +1234,7 @@ impl AmmPool {
 
     /// Return the current multisig configuration.
     pub fn get_multisig_config(env: Env) -> MultisigConfig {
+        Self::extend_ttl(&env);
         MultisigConfig {
             signers: Self::multisig_signers(&env),
             quorum: Self::multisig_quorum(&env),
@@ -1233,6 +1243,7 @@ impl AmmPool {
 
     /// Return the current multisig signers and quorum.
     pub fn get_multisig(env: Env) -> (soroban_sdk::Vec<Address>, u32) {
+        Self::extend_ttl(&env);
         (Self::multisig_signers(&env), Self::multisig_quorum(&env))
     }
 
@@ -1320,6 +1331,7 @@ impl AmmPool {
 
     /// Return a multisig proposal by id, if it exists.
     pub fn get_multisig_proposal(env: Env, proposal_id: u64) -> Option<MultisigProposal> {
+        Self::extend_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::MultisigProposalById(proposal_id))
@@ -1869,6 +1881,7 @@ impl AmmPool {
 
     /// Return the pending admin nominee, or `None` if no transfer is in progress.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PendingAdmin)
@@ -2942,6 +2955,7 @@ impl AmmPool {
     ///
     /// Panics if either reserve is zero (pool is empty).
     pub fn price_ratio(env: Env) -> Result<(i128, i128), AmmError> {
+        Self::extend_ttl(&env);
         let reserve_a = Self::get_reserve_a(env.clone());
         let reserve_b = Self::get_reserve_b(env);
         if reserve_a <= 0 || reserve_b <= 0 {
@@ -2971,6 +2985,7 @@ impl AmmPool {
     /// # Panics
     /// - If `token_in` is not one of the two pool tokens.
     pub fn get_amount_out(env: Env, token_in: Address, amount_in: i128) -> Result<i128, AmmError> {
+        Self::extend_ttl(&env);
         let token_a: Address = Self::read_token_a(&env)?;
         let token_b: Address = Self::read_token_b(&env)?;
         let fee_bps: i128 = Self::read_fee_bps(&env)?;
@@ -3009,6 +3024,7 @@ impl AmmPool {
         token_in: Address,
         amount_in: i128,
     ) -> Result<SwapSimulation, AmmError> {
+        Self::extend_ttl(&env);
         if amount_in <= 0 {
             return Err(AmmError::ZeroAmount);
         }
@@ -3064,6 +3080,7 @@ impl AmmPool {
     /// - `amount_out` is >= the output reserve (InsufficientLiquidity)
     /// - `fee_bps` is >= 10_000 (InvalidFeeBps)
     pub fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> Result<i128, AmmError> {
+        Self::extend_ttl(&env);
         let token_a: Address = Self::read_token_a(&env)?;
         let token_b: Address = Self::read_token_b(&env)?;
         let fee_bps: i128 = Self::read_fee_bps(&env)?;
@@ -3117,6 +3134,7 @@ impl AmmPool {
     /// # Returns
     /// The pool's `fee_bps` as an `i128`. For the full pool state, see [`AmmPool::get_info`].
     pub fn get_fee_info(env: Env) -> Result<i128, AmmError> {
+        Self::extend_ttl(&env);
         Self::read_fee_bps(&env)
     }
 
@@ -3136,6 +3154,7 @@ impl AmmPool {
     /// - `fee_recipient` — recipient of accrued protocol fees.
     /// - `protocol_fee_bps` — protocol fee in basis points (subset of `fee_bps`).
     pub fn get_info(env: Env) -> Result<PoolInfo, AmmError> {
+        Self::extend_ttl(&env);
         Ok(PoolInfo {
             token_a: Self::read_token_a(&env)?,
             token_b: Self::read_token_b(&env)?,
@@ -3171,6 +3190,7 @@ impl AmmPool {
     /// # Returns
     /// `(accrued_fee_a, accrued_fee_b)` — pending protocol fees in each token.
     pub fn get_accrued_fees(env: Env) -> (i128, i128) {
+        Self::extend_ttl(&env);
         let fee_a: i128 = env
             .storage()
             .instance()
@@ -3195,6 +3215,7 @@ impl AmmPool {
     /// The LP share balance of `provider`, or `0` if the address has never
     /// provided liquidity to this pool.
     pub fn shares_of(env: Env, provider: Address) -> Result<i128, AmmError> {
+        Self::extend_ttl(&env);
         let lp_token: Address = Self::read_lp_token(&env)?;
         Ok(LpTokenClient::new(&env, &lp_token).balance(&provider))
     }
@@ -3590,6 +3611,7 @@ impl AmmPool {
 
     /// Returns the cumulative liquidity accumulator and the timestamp of the last update.
     pub fn get_liquidity_cumulative(env: Env) -> (i128, u64) {
+        Self::extend_ttl(&env);
         let liquidity_cum = env
             .storage()
             .instance()
@@ -3605,6 +3627,7 @@ impl AmmPool {
 
     /// Returns the cumulative price accumulators and the timestamp of the last update.
     pub fn get_price_cumulative(env: Env) -> (i128, i128, u64) {
+        Self::extend_ttl(&env);
         let price_cum_a = env
             .storage()
             .instance()

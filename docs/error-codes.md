@@ -160,6 +160,7 @@ Defined in [contracts/batch_auction/src/lib.rs](../contracts/batch_auction/src/l
 | 20 | `NotInitialized` | An admin function, `get_admin` or `accept_admin` was called before `initialize`. | Call `initialize` first. |
 | 21 | `InvalidBatchWindow` | `initialize` or `set_batch_window` was given a window outside the configured bounds (default 5 s to 1 day), for example `0` or `u64::MAX`. | Pass a window within `get_window_bounds()`. |
 | 22 | `InvalidWindowBounds` | `set_window_bounds` was given `min == 0`, `min > max`, a `max` above 30 days, or bounds that exclude the current window. | Pass `0 < min <= max <= 30 days` with the current window inside them. |
+| 23 | `Paused` | `submit_order`, `submit_order_cl`, or `settle_batch` was called while the auction is paused. | Wait for the admin to call `unpause`; escrow recovery entrypoints remain available. |
 
 ---
 
@@ -184,6 +185,9 @@ Defined in [contracts/batch_router/src/lib.rs](../contracts/batch_router/src/lib
 | 13 | `Unauthorized` | The address supplied as admin to `pause`/`unpause`/`propose_admin`/`upgrade` is not the stored admin, or `accept_admin` was called with an address other than the pending nominee. | Pass the current admin (or the nominee) and sign as that address. |
 | 14 | `NoPendingAdmin` | `accept_admin` called while no `propose_admin` nomination is pending. | Have the admin call `propose_admin` first. |
 | 15 | `Paused` | The router is paused by its admin; returned by `execute_batch`, `simulate_batch` and `validate_batch` alike. | Wait for the admin to call `unpause`. |
+| 16 | `PoolDrained` | The target AMM pool is in terminal drained state (or has empty reserves in simulation), so swap/liquidity simulation refuses to quote it. | Treat the pool as retired; route to a different pool. |
+
+Current simulation note: `batch_router::simulate_batch` still does not replay AMM circuit-breaker and oracle-deviation checks, so those AMM guards can still diverge between simulation and execution.
 
 ---
 
@@ -206,7 +210,7 @@ Defined in [contracts/concentrated_liquidity/src/lib.rs](../contracts/concentrat
 | 11 | `Paused` | Pool is paused. | Wait for admin to unpause. |
 | 12 | `Unauthorized` | Admin mismatch. | Use the stored admin address. |
 | 13 | `TickNotAligned` | A tick was not a multiple of `tick_spacing`. | Round ticks to the nearest multiple of `tick_spacing`. |
-| 14 | `InvalidTickSpacing` | `tick_spacing ≤ 0` during initialization. | Use a positive tick spacing (common values: 1, 10, 60, 200). |
+| 14 | `InvalidTickSpacing` | `tick_spacing` is outside `[1, MAX_TICK]` during initialization. | Use a positive tick spacing no greater than `MAX_TICK` (887 272). |
 | 15 | `TickNotInitialized` | A swap crossed into a tick that has no liquidity (never been used by any position). | Ensure positions cover the full swap range, or use a smaller swap amount. |
 | 16 | `InvalidToken` | `token_in` is not `token_a` or `token_b`. | Check `get_info()` for valid token addresses. |
 | 17 | `RangeOrderInRange` | `place_range_order` called when current tick is inside `[lower_tick, upper_tick)`. | Select a tick range strictly above or below current tick. |
@@ -220,6 +224,7 @@ Defined in [contracts/concentrated_liquidity/src/lib.rs](../contracts/concentrat
 | 25 | `MathOverflow` | A position amount or liquidity figure computed by `mint_position`, `mint_position_single_token`, `quote_single_token_deposit`, `modify_position`, `burn_position` or `quote_position` does not fit in an `i128`, or an intermediate of its 256-bit evaluation does not fit in a `u128`. Reported instead of a truncated value (#963). | Use a smaller amount or liquidity, or a wider tick range. |
 | 26 | `ObservationTooOld` | `observe(seconds_ago)` requested a timestamp earlier than the oldest observation retained in the persistent oracle ring buffer (or `seconds_ago > now`) (#1101). | Query a smaller `seconds_ago` within the retained ring-buffer window, or have the admin grow the ring capacity via `set_oracle_cardinality`. |
 | 27 | `InvalidOracleCardinality` | `set_oracle_cardinality` was called with `0`, a value smaller than the current `cardinality`, or a value exceeding `MAX_ORACLE_CARDINALITY` (`2048`) (#1101). | Pass a cardinality in `[current_cardinality, 2048]`. |
+| 28 | `NftNotWiredToPool` | `set_position_nft` was called with an address that is not a `cl_position_nft` contract initialized with this pool's address as its `cl_pool`. | Initialize the `cl_position_nft` contract with this pool's address as `cl_pool` before calling `set_position_nft`. |
 
 `swap_exact_out(env, sender, zero_for_one, amount_out, sqrt_price_limit_x96,
 max_amount_in, deadline)` (#696) is the mirror of `swap`: it fixes the
@@ -389,7 +394,7 @@ Defined in [contracts/governance/src/lib.rs](../contracts/governance/src/lib.rs)
 | 27 | `DelegationCycle` | The delegation would create a cycle (A → B → … → A). | Choose a delegate that is not already part of this principal's delegation chain. |
 | 28 | `ProposalVetoed` | A veto multisig vetoed the proposal. | Create a new proposal; adjust to address the veto reason. |
 | 29 | `VetoWindowExpired` | Veto attempted after the veto window closed. | Vetoes must be cast within the veto window after voting ends. |
-| 30 | `NotVetoMultisig` | Veto called by an address that is not the configured veto multisig. | Only the veto multisig can veto proposals. |
+| 30 | `NotVetoMultisig` | **Reserved — never returned.** `veto` takes no caller argument: it reads the configured veto multisig and requires *that* address's authorization, so a non-multisig caller is rejected by Soroban's host auth check before any typed error is produced. Kept so no existing discriminant moves. | Do not handle this code; ensure the veto call is authorized by the configured multisig. |
 | 31 | `InsufficientSnapshotBal` | Snapshot balance at proposal creation was insufficient. | Acquire more LP tokens before the proposal snapshot block. |
 | 32 | `VetoMultisigNotSet` | Veto-related operation called when no veto multisig is configured. | Configure the veto multisig during governance initialization. |
 | 33 | `NoPendingAdmin` | `accept_admin` called without a prior `propose_admin`. | Call `propose_admin` first to nominate a successor. |
@@ -496,6 +501,7 @@ Defined in [contracts/router/src/lib.rs](../contracts/router/src/lib.rs) as `Rou
 | 10 | `Unauthorized` | An admin-only operation used the wrong admin, or `accept_admin` was called by an address other than the nominee. | Pass the stored or nominated address and sign with its key. |
 | 11 | `InvalidFactory` | `initialize` could not call the factory's `get_pool_count` interface. | Pass a deployed factory contract address. |
 | 12 | `NoPendingAdmin` | `accept_admin` was called without a pending nomination. | Call `propose_admin` first. |
+| 13 | `PoolCallFailed` | A hop pool rejected a swap or quote call (e.g. paused, empty reserves, or another pool-level error). | Inspect the hop pools along the path (pause state, reserves, liquidity) before retrying. |
 
 ---
 
@@ -518,8 +524,8 @@ Defined in [contracts/staking/src/lib.rs](../contracts/staking/src/lib.rs) as `S
 | 11 | `NoActiveLock` | `extend_lock` was called on a position with no active lock. | Stake with a lock duration first. |
 | 12 | `InvalidDuration` | A lock duration argument was zero where a positive value is required. | Specify a positive lock duration in seconds. |
 | 13 | `NothingToStake` | A stake call supplied neither a positive amount nor a lock duration. | Pass a positive amount, a lock duration, or both. |
-| 14 | `InvalidBoostConfig` | The boost bounds were non-positive, or the max was below the min. | Pass `0 < min_boost <= max_boost`. |
-| 15 | `InvalidLockDuration` | The lock-duration bounds were non-positive, or the max was below the min. | Pass `0 < min_lock_duration <= max_lock_duration`. |
+| 14 | `InvalidBoostConfig` | The boost bounds were non-positive, the max was below the min, or the max exceeded `MAX_BOOST_SCALED` (4x = `40_000`). | Pass `0 < min_boost <= max_boost <= 40_000`. |
+| 15 | `InvalidLockDuration` | The lock-duration bounds were non-positive, the max was below the min, the max exceeded `MAX_LOCK_DURATION` (4 years), or `now + duration` would overflow a `u64`. | Pass `0 < min_lock_duration <= max_lock_duration <= 126_144_000` (4 years in seconds). |
 | 16 | `MaxRewardPoolExceeded` | `add_rewards` would push the undistributed reward balance above the configured cap. | Lower the amount added, or raise the cap with `set_max_reward_pool_balance`. |
 | 17 | `InvalidMaxBalance` | A new max-balance cap was set below the current undistributed reward balance. | Use a cap of `0` (no cap) or one at least the current undistributed balance. |
 | 18 | `NoStakers` | `update_rewards` was called while the pool has no effective stake. | Wait until at least one address has staked. |
@@ -564,6 +570,7 @@ Defined in [contracts/oracle_adapters/src/lib.rs](../contracts/oracle_adapters/s
 | 6 | `StaleSnapshot` | The newest snapshot is older than the configured `max_age_seconds`. | Wait for a fresh snapshot from the keeper. |
 | 7 | `InvalidPrice` | The computed TWAP price is zero or negative. | Check that the pool reserves and cumulative prices are positive. |
 | 8 | `ArithmeticOverflow` | A price conversion or scaling step overflowed. | Use a smaller amount or a pool with less extreme reserves. |
+| 9 | `CrossContractCallFailed` | A cross-contract call to the configured factory or TWAP consumer failed or panicked. | Verify the configured factory and TWAP consumer addresses and ensure the callee contracts are healthy. |
 
 ---
 
@@ -634,6 +641,7 @@ Defined in [contracts/twap_consumer/src/lib.rs](../contracts/twap_consumer/src/l
 | 19 | `TooManyPools` | `get_twap_batch` was called with more pools than `MAX_TRACKED_POOLS`. | Split the request into smaller batches. |
 | 20 | `NoPendingKeeper` | `accept_keeper` was called while no `propose_keeper` nomination is pending. | Have the current keeper call `propose_keeper` first. |
 | 21 | `WrongPendingKeeper` | `accept_keeper` was called with an address other than the pending keeper. | Sign and call `accept_keeper` as the nominated address. |
+| 22 | `CannotDeleteRequiredSnapshot` | `delete_snapshot` was called on the newest remaining snapshot or when fewer than 3 snapshots are stored (which would leave fewer than 2 retained snapshots for TWAP reads). | Save additional snapshots first, or delete only older non-newest snapshots while at least 3 are retained. |
 
 ---
 

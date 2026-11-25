@@ -5774,3 +5774,125 @@ fn test_circuit_breaker_trip_still_lets_lps_remove_liquidity() {
         Err(Ok(AmmError::Paused))
     );
 }
+
+fn assert_view_extends_instance_ttl<F>(view_name: &str, invoke: F)
+where
+    F: FnOnce(&TestSetup, &AmmPoolClient, &Address),
+{
+    use soroban_sdk::testutils::storage::Instance as _;
+
+    const TTL_THRESHOLD: u32 = 172_800;
+    const TTL_BUMP: u32 = 518_400;
+
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+
+    let provider = Address::generate(env);
+    StellarAssetClient::new(env, &ts.ta_addr).mint(&provider, &10_000_000_i128);
+    StellarAssetClient::new(env, &ts.tb_addr).mint(&provider, &10_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 10_000_000, 10_000_000).execute();
+
+    // Advance ledger so the instance TTL drops below the renewal threshold.
+    env.ledger().with_mut(|li| {
+        li.sequence_number += 400_000;
+    });
+    let ttl_before = env.as_contract(&ts.amm_addr, || env.storage().instance().get_ttl());
+    assert!(
+        ttl_before < TTL_THRESHOLD,
+        "{view_name}: expected ttl_before ({ttl_before}) < {TTL_THRESHOLD}"
+    );
+
+    invoke(&ts, &amm, &provider);
+
+    let ttl_after = env.as_contract(&ts.amm_addr, || env.storage().instance().get_ttl());
+    assert!(
+        ttl_after >= TTL_BUMP,
+        "{view_name}: expected instance TTL to be renewed to at least {TTL_BUMP}, got {ttl_after}"
+    );
+}
+
+#[test]
+fn test_quote_views_extend_instance_ttl() {
+    assert_view_extends_instance_ttl("price_ratio", |_ts, amm, _lp| {
+        let (pa, pb) = amm.price_ratio();
+        assert!(pa > 0 && pb > 0);
+    });
+    assert_view_extends_instance_ttl("get_amount_out", |ts, amm, _lp| {
+        assert!(amm.get_amount_out(&ts.ta_addr, &100_000) > 0);
+    });
+    assert_view_extends_instance_ttl("simulate_swap", |ts, amm, _lp| {
+        assert!(amm.simulate_swap(&ts.ta_addr, &100_000).amount_out > 0);
+    });
+    assert_view_extends_instance_ttl("get_amount_in", |ts, amm, _lp| {
+        assert!(amm.get_amount_in(&ts.tb_addr, &100_000) > 0);
+    });
+}
+
+#[test]
+fn test_pool_state_views_extend_instance_ttl() {
+    assert_view_extends_instance_ttl("is_paused", |_ts, amm, _lp| {
+        assert!(!amm.is_paused());
+    });
+    assert_view_extends_instance_ttl("is_drained", |_ts, amm, _lp| {
+        assert!(!amm.is_drained());
+    });
+    assert_view_extends_instance_ttl("is_locked", |_ts, amm, _lp| {
+        assert!(!amm.is_locked());
+    });
+    assert_view_extends_instance_ttl("flash_loan_locked", |_ts, amm, _lp| {
+        assert!(!amm.flash_loan_locked());
+    });
+    assert_view_extends_instance_ttl("exits_allowed_when_paused", |_ts, amm, _lp| {
+        assert!(amm.exits_allowed_when_paused());
+    });
+    assert_view_extends_instance_ttl("get_info", |_ts, amm, _lp| {
+        assert_eq!(amm.get_info().fee_bps, 30);
+    });
+    assert_view_extends_instance_ttl("shares_of", |_ts, amm, lp| {
+        assert!(amm.shares_of(lp) > 0);
+    });
+    assert_view_extends_instance_ttl("get_liquidity_cumulative", |_ts, amm, _lp| {
+        let _ = amm.get_liquidity_cumulative();
+    });
+    assert_view_extends_instance_ttl("get_price_cumulative", |_ts, amm, _lp| {
+        let _ = amm.get_price_cumulative();
+    });
+}
+
+#[test]
+fn test_admin_and_fee_views_extend_instance_ttl() {
+    assert_view_extends_instance_ttl("get_emergency_announcement", |_ts, amm, _lp| {
+        assert!(amm.get_emergency_announcement().is_none());
+    });
+    assert_view_extends_instance_ttl("get_emergency_delay", |_ts, amm, _lp| {
+        let _ = amm.get_emergency_delay();
+    });
+    assert_view_extends_instance_ttl("get_circuit_breaker_config", |_ts, amm, _lp| {
+        assert!(amm.get_circuit_breaker_config().threshold_bps > 0);
+    });
+    assert_view_extends_instance_ttl("get_protocol_fee", |_ts, amm, _lp| {
+        let _ = amm.get_protocol_fee();
+    });
+    assert_view_extends_instance_ttl("get_lp_rebate", |_ts, amm, _lp| {
+        assert_eq!(amm.get_lp_rebate(), 0);
+    });
+    assert_view_extends_instance_ttl("get_multisig_config", |_ts, amm, _lp| {
+        assert_eq!(amm.get_multisig_config().quorum, 0);
+    });
+    assert_view_extends_instance_ttl("get_multisig", |_ts, amm, _lp| {
+        assert_eq!(amm.get_multisig().1, 0);
+    });
+    assert_view_extends_instance_ttl("get_multisig_proposal", |_ts, amm, _lp| {
+        assert!(amm.get_multisig_proposal(&0).is_none());
+    });
+    assert_view_extends_instance_ttl("get_pending_admin", |_ts, amm, _lp| {
+        assert!(amm.get_pending_admin().is_none());
+    });
+    assert_view_extends_instance_ttl("get_fee_info", |_ts, amm, _lp| {
+        assert_eq!(amm.get_fee_info(), 30);
+    });
+    assert_view_extends_instance_ttl("get_accrued_fees", |_ts, amm, _lp| {
+        assert_eq!(amm.get_accrued_fees(), (0, 0));
+    });
+}

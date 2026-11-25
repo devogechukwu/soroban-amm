@@ -82,13 +82,13 @@ function commandsFromBlock(block) {
         const continues = /\\\s*$/.test(line);
         pending += `${pending ? ' ' : ''}${line.replace(/\s*\\\s*$/, '')}`;
         if (continues) continue;
-        if (pending.includes('stellar contract invoke')) {
+        if (/\b(?:stellar|soroban) contract invoke\b/.test(pending)) {
             commands.push({ text: pending, line: firstLine, annotation });
             annotation = null;
         }
         pending = '';
     }
-    if (pending.includes('stellar contract invoke')) commands.push({ text: pending, line: firstLine, annotation });
+    if (/\b(?:stellar|soroban) contract invoke\b/.test(pending)) commands.push({ text: pending, line: firstLine, annotation });
     return commands;
 }
 
@@ -208,6 +208,10 @@ export function validateMarkdown(markdown, file, interfaces) {
     const errors = [];
     for (const block of parseFences(markdown)) {
         for (const command of commandsFromBlock(block)) {
+            if (/\bsoroban contract invoke\b/.test(command.text)) {
+                errors.push(`${file}:${command.line}: use \`stellar contract invoke\` instead of the legacy \`soroban contract invoke\``);
+                continue;
+            }
             const invocation = parseInvocation(command.text);
             if (!invocation) continue;
             const { functionName, flagsBefore, flagsAfter } = invocation;

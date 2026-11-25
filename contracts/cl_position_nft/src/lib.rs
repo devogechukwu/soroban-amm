@@ -641,6 +641,14 @@ impl ClPositionNft {
             return Err(NftError::Unauthorized);
         }
 
+        let zero_account = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if approved == zero_account || approved == owner {
+            return Err(NftError::InvalidAddress);
+        }
+
         let approved_key = DataKey::Approved(token_id);
         env.storage().persistent().set(&approved_key, &approved);
         Self::bump_persistent(&env, &approved_key);
@@ -808,11 +816,21 @@ impl ClPositionNft {
     }
 
     /// Returns whether `owner` accepts incoming transfers (true by default).
+    ///
+    /// An explicit opt-out is a security/compliance preference, so a recorded
+    /// value is bumped on every read; otherwise the entry could be evicted and
+    /// the getter would silently fall back to `true`, re-enabling transfers the
+    /// owner refused. Absent entries stay absent — the default is `true` and
+    /// there is nothing to keep alive.
     pub fn accepts_transfers(env: Env, owner: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AcceptTransfers(owner))
-            .unwrap_or(true)
+        let key = DataKey::AcceptTransfers(owner);
+        match env.storage().persistent().get::<_, bool>(&key) {
+            Some(accepts) => {
+                Self::bump_persistent(&env, &key);
+                accepts
+            }
+            None => true,
+        }
     }
 
     /// Set whether this address accepts incoming NFT transfers.
@@ -1304,6 +1322,41 @@ mod tests {
         client.set_approval_for_all(&receiver, &operator, &true);
         client.transfer(&operator, &owner, &receiver, &id);
         assert_eq!(client.owner_of(&id), receiver);
+    }
+
+    /// An explicit opt-out must not lapse just because nobody touched the
+    /// contract for a while: reading it has to renew its TTL before the entry
+    /// can fall out of the ledger and silently revert to the default `true`.
+    #[test]
+    fn accepts_transfers_renews_opt_out_across_ttl_lapse() {
+        use soroban_sdk::testutils::{storage::Persistent as _, Ledger as _};
+
+        let (env, client, _admin, _pool, _) = setup();
+        let opted_out = Address::generate(&env);
+        let never_opted_out = Address::generate(&env);
+        client.set_accept_transfers(&opted_out, &false);
+
+        // Drop the entry's remaining TTL below DEFAULT_MIN_TTL without letting
+        // it expire (~150 days of no traffic at the default parameters).
+        env.ledger().with_mut(|li| {
+            li.sequence_number +=
+                ClPositionNft::DEFAULT_BUMP_TO - ClPositionNft::DEFAULT_MIN_TTL + 1
+        });
+
+        assert!(!client.accepts_transfers(&opted_out));
+        // An address that never opted out keeps the default.
+        assert!(client.accepts_transfers(&never_opted_out));
+
+        env.as_contract(&client.address, || {
+            let ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::AcceptTransfers(opted_out.clone()));
+            assert!(
+                ttl >= ClPositionNft::DEFAULT_BUMP_TO - 1,
+                "AcceptTransfers TTL {ttl} should be bumped toward DEFAULT_BUMP_TO"
+            );
+        });
     }
 
     #[test]
@@ -2312,5 +2365,81 @@ mod tests {
             last_versioned_event(&env, &client.address, "transfer");
         assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(token_id, id);
+    }
+
+    #[test]
+    fn approve_rejects_zero_address_and_preserves_prior_approval() {
+        let (env, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+        let zero_account = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+
+        // Rejects zero address when no prior approval exists
+        assert_eq!(
+            client.try_approve(&user, &zero_account, &id),
+            Err(Ok(NftError::InvalidAddress))
+        );
+        assert_eq!(client.get_approved(&id), None);
+
+        // Rejects zero address and preserves existing approval
+        let spender = Address::generate(&env);
+        client.approve(&user, &spender, &id);
+        assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+        assert_eq!(
+            client.try_approve(&user, &zero_account, &id),
+            Err(Ok(NftError::InvalidAddress))
+        );
+        assert_eq!(client.get_approved(&id), Some(spender));
+    }
+
+    #[test]
+    fn approve_rejects_self_approval_and_preserves_prior_approval() {
+        let (env, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+
+        // Rejects owner approving themselves
+        assert_eq!(
+            client.try_approve(&user, &user, &id),
+            Err(Ok(NftError::InvalidAddress))
+        );
+        assert_eq!(client.get_approved(&id), None);
+
+        // Preserves existing approval on self-approval attempt
+        let spender = Address::generate(&env);
+        client.approve(&user, &spender, &id);
+        assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+        assert_eq!(
+            client.try_approve(&user, &user, &id),
+            Err(Ok(NftError::InvalidAddress))
+        );
+        assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+        // Also rejects an approved operator approving the owner
+        let operator = Address::generate(&env);
+        client.set_approval_for_all(&user, &operator, &true);
+        assert_eq!(
+            client.try_approve(&operator, &user, &id),
+            Err(Ok(NftError::InvalidAddress))
+        );
+        assert_eq!(client.get_approved(&id), Some(spender));
+    }
+
+    #[test]
+    fn approve_and_transfer_clears_approval() {
+        let (env, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+        let spender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        client.approve(&user, &spender, &id);
+        assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+        client.transfer(&spender, &user, &recipient, &id);
+        assert_eq!(client.owner_of(&id), recipient);
+        assert_eq!(client.get_approved(&id), None);
     }
 }

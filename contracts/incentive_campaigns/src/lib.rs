@@ -658,6 +658,7 @@ impl IncentiveCampaigns {
 
     /// Return the build version of this contract (`CONTRACT_VERSION`).
     pub fn version(_env: Env) -> u32 {
+        extend_instance_ttl(&_env);
         CONTRACT_VERSION
     }
 
@@ -693,11 +694,13 @@ impl IncentiveCampaigns {
 
     /// Return the active governance address.
     pub fn get_governance(env: Env) -> Result<Address, IncentiveError> {
+        extend_instance_ttl(&env);
         Self::read_governance(&env)
     }
 
     /// Return the pending governance nominee, if any.
     pub fn get_pending_governance(env: Env) -> Option<Address> {
+        extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PendingGovernance)
@@ -1902,9 +1905,14 @@ impl IncentiveCampaigns {
         Ok(dist_id)
     }
 
-    /// The original live-balance claim, kept verbatim for campaigns created
-    /// before the stake-based model (no `StakeBased` marker). The caller has
-    /// already checked that the campaign is active and has started.
+    /// The original live-balance claim, kept for campaigns created before
+    /// the stake-based model (no `StakeBased` marker). The caller has already
+    /// checked that the campaign is active and has started.
+    ///
+    /// The payout is clamped to `funding_amount - total_distributed`, so a
+    /// legacy campaign can never pay out more than it was funded with even if
+    /// its accumulator has been repriced. When the clamp reduces the payout to
+    /// zero, `NoPendingRewards` is returned (same as `claim_rewards`).
     fn claim_rewards_legacy(
         env: &Env,
         provider: &Address,
@@ -1948,7 +1956,13 @@ impl IncentiveCampaigns {
             }
             Some(snap) => {
                 let acc_delta = campaign.acc_reward_per_share - snap.acc_at_snapshot;
-                let p = lp_balance * acc_delta / PRECISION;
+                let mut p = lp_balance * acc_delta / PRECISION;
+                // Never pay out more than the campaign was funded with. Mirrors
+                // the stake-based path's `unpaid_funding` clamp in `claim_rewards`.
+                let unpaid_funding = campaign.funding_amount - campaign.total_distributed;
+                if p > unpaid_funding {
+                    p = unpaid_funding;
+                }
                 if p <= 0 {
                     return Err(IncentiveError::NoPendingRewards);
                 }
@@ -5406,5 +5420,98 @@ mod tests {
 
         client.unpause(&gov);
         assert!(client.claim_rewards(&provider, &id) > 0);
+    }
+
+    // ── Issue #1320: legacy claim must not overpay ──────────────────────────
+    //
+    // `claim_rewards_legacy` computed its payout from the live LP balance times
+    // the accumulator delta without clamping to `funding_amount`. A legacy
+    // campaign whose accumulator had been repriced (e.g. a governance error, or
+    // a bug in `advance_accumulator`) could pay a provider more than the
+    // campaign was funded with, draining the shared reward-token balance that
+    // other active campaigns relied on. `recover_leftover_funds` then saw
+    // `funding_amount - total_distributed < 0` and returned `NoLeftoverFunds`,
+    // so the excess was unrecoverable. These two tests pin the clamp.
+
+    /// Force a campaign's `acc_reward_per_share` to a value large enough that
+    /// `lp_balance * acc_delta / PRECISION` exceeds `funding_amount` by a wide
+    /// margin, while leaving the provider's snapshot at zero so the delta is
+    /// the whole accumulator.
+    fn inflate_accumulator(env: &Env, incentives: &Address, campaign_id: u64, new_acc: i128) {
+        env.as_contract(incentives, || {
+            let key = DataKey::Campaign(campaign_id);
+            let mut campaign: Campaign = env.storage().persistent().get(&key).unwrap();
+            campaign.acc_reward_per_share = new_acc;
+            env.storage().persistent().set(&key, &campaign);
+        });
+    }
+
+    #[test]
+    fn legacy_claim_is_capped_at_funding_amount() {
+        let (env, incentives, pool, lp, reward, provider, gov_addr) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+
+        // Campaign: t=1_000..5_000, rate=100, funding=1_000_000.
+        let funding: i128 = 1_000_000;
+        let id = client.create_campaign(
+            &gov_addr, &pool, &lp, &reward, &1_000, &5_000, &100, &funding,
+        );
+        make_legacy(&env, &incentives, id);
+
+        // Establish the provider's snapshot at t=1_000 (returns 0, delta == 0).
+        assert_eq!(client.claim_rewards(&provider, &id), 0);
+
+        // Provider holds ~999_000 LP shares out of 1_000_000 total supply.
+        // Inflate the accumulator so the raw payout is far greater than
+        // `funding`. `999_000 * acc / 1e12 > 1_000_000` requires
+        // `acc > 1e12 * 1_000_000 / 999_000`, so use 100x that to make the
+        // overpay obvious before the clamp.
+        inflate_accumulator(&env, &incentives, id, 100_000_000_000_000_000);
+
+        // Advance past campaign end so `advance_accumulator` is a no-op.
+        env.ledger().with_mut(|l| l.timestamp = 5_000);
+
+        let paid = client.claim_rewards(&provider, &id);
+
+        // On main this is ~99_900_000_000 — the clamp is what limits it.
+        assert_eq!(
+            paid, funding,
+            "legacy payout must not exceed funding_amount"
+        );
+        assert_eq!(client.get_campaign(&id).total_distributed, funding);
+        assert!(client.get_campaign(&id).total_distributed <= funding);
+    }
+
+    #[test]
+    fn legacy_claim_leaves_no_leftover_funds_error() {
+        let (env, incentives, pool, lp, reward, provider, gov_addr) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+        let treasury = Address::generate(&env);
+
+        let funding: i128 = 1_000_000;
+        let id = client.create_campaign(
+            &gov_addr, &pool, &lp, &reward, &1_000, &5_000, &100, &funding,
+        );
+        make_legacy(&env, &incentives, id);
+
+        // Establish the provider's snapshot, then inflate the accumulator so
+        // the claim would over-pay without the clamp.
+        assert_eq!(client.claim_rewards(&provider, &id), 0);
+        inflate_accumulator(&env, &incentives, id, 100_000_000_000_000_000);
+        env.ledger().with_mut(|l| l.timestamp = 5_000);
+        assert_eq!(client.claim_rewards(&provider, &id), funding);
+
+        // After a full-funding claim there is no leftover. On main the overpay
+        // left `total_distributed > funding_amount`, so `funding - distributed`
+        // was negative and `recover_leftover_funds` still returned
+        // `NoLeftoverFunds` — masking the corruption. Here the invariant holds
+        // by construction and the same error is the honest answer.
+        env.ledger().with_mut(|l| l.timestamp = 700_000);
+        assert_eq!(
+            client.try_recover_leftover_funds(&gov_addr, &id, &treasury),
+            Err(Ok(IncentiveError::NoLeftoverFunds)),
+            "no leftover after a capped legacy claim"
+        );
+        assert_eq!(client.get_campaign(&id).total_distributed, funding);
     }
 }
